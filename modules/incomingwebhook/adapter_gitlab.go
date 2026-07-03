@@ -153,14 +153,30 @@ type glNoteEvent struct {
 	Project glProject `json:"project"`
 }
 
+// glBuild 是 pipeline 事件 builds[] 里单个 job 的白名单字段（stage/started_at/
+// runner 等一律忽略，只取渲染需要的 name + status）。
+type glBuild struct {
+	Name   string `json:"name"`
+	Status string `json:"status"`
+}
+
 type glPipelineEvent struct {
 	ObjectAttributes struct {
 		ID     int    `json:"id"`
 		Ref    string `json:"ref"`
 		Status string `json:"status"`
+		// Source 是 GitLab 侧受限枚举（push/web/schedule/api/trigger/…），但
+		// payload 由调用方 POST、无法保证真是 GitLab 生成，渲染前仍按外部自由文本
+		// 处理（mdInertText 转义），不当作已验证的枚举。
+		Source string `json:"source"`
+		// Duration 单位秒。GitLab 对终态 pipeline 恒带该字段；用 >0 而非「字段存在」
+		// 判断展示与否——JSON 里字段缺省时 int 零值也是 0，效果等价，无需再引入
+		// 一个 *int 只为区分「未知」与「恰好 0 秒」这个几乎不会发生的边界。
+		Duration int `json:"duration"`
 	} `json:"object_attributes"`
 	User    glUser    `json:"user"`
 	Project glProject `json:"project"`
+	Builds  []glBuild `json:"builds"`
 }
 
 // parseGitLabPush 把 GitLab webhook 事件翻译成 native 推送请求（pushAdapter.parse）。
@@ -319,6 +335,10 @@ func renderGitLabNote(body []byte) (string, error) {
 	return line, nil
 }
 
+// glMaxRenderedJobs 渲染的 job 列表上限（与 push 的 commits 同理：矩阵/并行 job
+// 一个 pipeline 可能有几十个，全列会刷屏）。
+const glMaxRenderedJobs = 10
+
 func renderGitLabPipeline(body []byte) (string, error) {
 	var ev glPipelineEvent
 	if err := json.Unmarshal(body, &ev); err != nil {
@@ -342,7 +362,83 @@ func renderGitLabPipeline(body []byte) (string, error) {
 		line = fmt.Sprintf("Pipeline #%d %s on `%s`",
 			ev.ObjectAttributes.ID, ev.ObjectAttributes.Status, glShortRef(ev.ObjectAttributes.Ref))
 	}
-	return glWithRepo(line, ev.Project), nil
+	// 状态 emoji 前缀：只用固定映射表拼字面量，不把 Status 本身插进模板，杜绝把
+	// switch 已校验的三个终态之外的字符串当格式串用（本就是白名单值，但保持同一
+	// 拼接习惯，便于以后扩展渲染子集时不必重新审计）。
+	line = glPipelineStatusIcon(ev.ObjectAttributes.Status) + " " + glWithRepo(line, ev.Project)
+
+	// Duration / Source 是可选元信息行：GitLab 对老版本/自建实例可能不带这两个字段，
+	// 缺省时不渲染空行。Source 走 mdInertText——见 glPipelineEvent.Source 注释，
+	// 不当作已验证枚举。
+	var meta []string
+	if ev.ObjectAttributes.Duration > 0 {
+		meta = append(meta, "duration: "+glFormatDuration(ev.ObjectAttributes.Duration))
+	}
+	if ev.ObjectAttributes.Source != "" {
+		meta = append(meta, "source: "+mdInertText(ev.ObjectAttributes.Source, 40))
+	}
+	if len(meta) > 0 {
+		line += "\n" + strings.Join(meta, " · ")
+	}
+
+	// Job 列表：与 push 的 commits 列表同一渲染习惯（bullet + 溢出尾注）。job name
+	// 来自调用方提交的 .gitlab-ci.yml，属外部自由文本，经 mdInertText 转义。
+	if n := len(ev.Builds); n > 0 {
+		var b strings.Builder
+		fmt.Fprintf(&b, "\nJobs (%d):", n)
+		for i, job := range ev.Builds {
+			if i == glMaxRenderedJobs {
+				fmt.Fprintf(&b, "\n- …and %d more", n-glMaxRenderedJobs)
+				break
+			}
+			fmt.Fprintf(&b, "\n- %s %s", glJobStatusIcon(job.Status), mdInertText(job.Name, 80))
+		}
+		line += b.String()
+	}
+
+	return line, nil
+}
+
+// glFormatDuration 把秒数格式化成 "7m 34s" / "42s"（与 Discord 等平台惯用格式一致）。
+func glFormatDuration(seconds int) string {
+	if seconds < 60 {
+		return fmt.Sprintf("%ds", seconds)
+	}
+	return fmt.Sprintf("%dm %ds", seconds/60, seconds%60)
+}
+
+// glPipelineStatusIcon 只覆盖 renderGitLabPipeline 已放行的三个终态，default 分支
+// 理论不可达（防御性兜底，不返回空避免消息开头出现孤立空格）。
+func glPipelineStatusIcon(status string) string {
+	switch status {
+	case "success":
+		return "✅"
+	case "failed":
+		return "❌"
+	case "canceled":
+		return "🚫"
+	default:
+		return "❔"
+	}
+}
+
+// glJobStatusIcon 覆盖 builds[].status 的常见取值；job 级状态比 pipeline 级更丰富
+// （manual/skipped 等在 job 上很常见，不代表刷屏，只是单个 job 的正常终态）。
+func glJobStatusIcon(status string) string {
+	switch status {
+	case "success":
+		return "✅"
+	case "failed":
+		return "❌"
+	case "canceled":
+		return "🚫"
+	case "skipped":
+		return "⏭️"
+	case "manual":
+		return "👆"
+	default:
+		return "⏳"
+	}
 }
 
 // glActor 优先用 username（GitLab 用户名字符集受限：[a-zA-Z0-9_.-]，进 `**X**` 粗体

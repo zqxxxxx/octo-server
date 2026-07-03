@@ -283,11 +283,18 @@ func TestParseGitLabPush_Pipeline(t *testing.T) {
 		req, _, _ := parseGitLabPush(glHeader("Pipeline Hook"), []byte(fmt.Sprintf(tpl, "failed")))
 		require.NotNil(t, req)
 		assert.Contains(t, req.Content, "Pipeline [#99](https://gitlab.com/o/r/-/pipelines/99) failed on `main`")
+		assert.True(t, strings.HasPrefix(req.Content, "❌ "), "failed pipelines are prefixed with a status icon")
 	})
 	t.Run("success is rendered", func(t *testing.T) {
 		req, _, _ := parseGitLabPush(glHeader("Pipeline Hook"), []byte(fmt.Sprintf(tpl, "success")))
 		require.NotNil(t, req)
 		assert.Contains(t, req.Content, "Pipeline [#99](https://gitlab.com/o/r/-/pipelines/99) success on `main`")
+		assert.True(t, strings.HasPrefix(req.Content, "✅ "), "success pipelines are prefixed with a status icon")
+	})
+	t.Run("canceled is rendered", func(t *testing.T) {
+		req, _, _ := parseGitLabPush(glHeader("Pipeline Hook"), []byte(fmt.Sprintf(tpl, "canceled")))
+		require.NotNil(t, req)
+		assert.True(t, strings.HasPrefix(req.Content, "🚫 "), "canceled pipelines are prefixed with a status icon")
 	})
 	t.Run("running is skipped", func(t *testing.T) {
 		req, skip, _ := parseGitLabPush(glHeader("Pipeline Hook"), []byte(fmt.Sprintf(tpl, "running")))
@@ -301,6 +308,81 @@ func TestParseGitLabPush_Pipeline(t *testing.T) {
 		assert.Contains(t, req.Content, "Pipeline #99 failed on `main`")
 		assert.NotContains(t, req.Content, "](/-/pipelines", "must not emit a relative-path link when web_url is absent")
 		assert.NotContains(t, req.Content, "[#99]", "no markdown link without an absolute base url")
+	})
+}
+
+// duration / source 是可选元信息：字段缺省时不渲染多余的空行（原有 fixture 均不带
+// 这两个字段，TestParseGitLabPush_Pipeline 已隐式覆盖「缺省时无 meta 行」）。
+func TestParseGitLabPush_PipelineDurationAndSource(t *testing.T) {
+	body := `{"object_attributes":{"id":99,"ref":"main","status":"success","source":"push","duration":454},
+		"project":{"path_with_namespace":"o/r","web_url":"https://gitlab.com/o/r"}}`
+	req, _, _ := parseGitLabPush(glHeader("Pipeline Hook"), []byte(body))
+	require.NotNil(t, req)
+	assert.Contains(t, req.Content, "duration: 7m 34s · source: push")
+
+	t.Run("sub-minute duration has no minute component", func(t *testing.T) {
+		short := `{"object_attributes":{"id":99,"ref":"main","status":"success","duration":42},
+			"project":{"path_with_namespace":"o/r","web_url":"https://gitlab.com/o/r"}}`
+		req, _, _ := parseGitLabPush(glHeader("Pipeline Hook"), []byte(short))
+		require.NotNil(t, req)
+		assert.Contains(t, req.Content, "duration: 42s")
+	})
+
+	t.Run("source is escaped as inert text", func(t *testing.T) {
+		// source 不当作已验证枚举（见 glPipelineEvent.Source 注释），拼进纯文本前须转义。
+		malicious := `{"object_attributes":{"id":99,"ref":"main","status":"success","source":"**push**"},
+			"project":{"path_with_namespace":"o/r","web_url":"https://gitlab.com/o/r"}}`
+		req, _, _ := parseGitLabPush(glHeader("Pipeline Hook"), []byte(malicious))
+		require.NotNil(t, req)
+		assert.Contains(t, req.Content, `source: \*\*push\*\*`)
+	})
+}
+
+func TestParseGitLabPush_PipelineJobs(t *testing.T) {
+	body := `{"object_attributes":{"id":99,"ref":"main","status":"success"},
+		"project":{"path_with_namespace":"o/r","web_url":"https://gitlab.com/o/r"},
+		"builds":[{"name":"package_test","status":"success"},{"name":"deploy","status":"failed"},
+			{"name":"notify","status":"skipped"},{"name":"gate","status":"manual"},
+			{"name":"lint","status":"running"}]}`
+	req, _, _ := parseGitLabPush(glHeader("Pipeline Hook"), []byte(body))
+	require.NotNil(t, req)
+	assert.Contains(t, req.Content, "Jobs (5):")
+	assert.Contains(t, req.Content, `- ✅ package\_test`, "underscore in job name is escaped as inert text")
+	assert.Contains(t, req.Content, "- ❌ deploy")
+	assert.Contains(t, req.Content, "- ⏭️ notify")
+	assert.Contains(t, req.Content, "- 👆 gate")
+	assert.Contains(t, req.Content, "- ⏳ lint")
+
+	t.Run("no builds field renders no Jobs section", func(t *testing.T) {
+		noBuilds := `{"object_attributes":{"id":99,"ref":"main","status":"success"},
+			"project":{"path_with_namespace":"o/r","web_url":"https://gitlab.com/o/r"}}`
+		req, _, _ := parseGitLabPush(glHeader("Pipeline Hook"), []byte(noBuilds))
+		require.NotNil(t, req)
+		assert.NotContains(t, req.Content, "Jobs")
+	})
+
+	t.Run("job list beyond the cap is truncated with an overflow note", func(t *testing.T) {
+		builds := make([]string, 0, 12)
+		for i := 0; i < 12; i++ {
+			builds = append(builds, fmt.Sprintf(`{"name":"job-%d","status":"success"}`, i))
+		}
+		many := fmt.Sprintf(`{"object_attributes":{"id":99,"ref":"main","status":"success"},
+			"project":{"path_with_namespace":"o/r","web_url":"https://gitlab.com/o/r"},
+			"builds":[%s]}`, strings.Join(builds, ","))
+		req, _, _ := parseGitLabPush(glHeader("Pipeline Hook"), []byte(many))
+		require.NotNil(t, req)
+		assert.Contains(t, req.Content, "Jobs (12):")
+		assert.Contains(t, req.Content, "…and 2 more", "only %d jobs are listed", glMaxRenderedJobs)
+		assert.NotContains(t, req.Content, "job-11", "jobs beyond the cap are not rendered")
+	})
+
+	t.Run("job name is escaped as inert text", func(t *testing.T) {
+		malicious := `{"object_attributes":{"id":99,"ref":"main","status":"success"},
+			"project":{"path_with_namespace":"o/r","web_url":"https://gitlab.com/o/r"},
+			"builds":[{"name":"**evil** [x](http://attacker)","status":"success"}]}`
+		req, _, _ := parseGitLabPush(glHeader("Pipeline Hook"), []byte(malicious))
+		require.NotNil(t, req)
+		assert.Contains(t, req.Content, `\*\*evil\*\* \[x\](http://attacker)`)
 	})
 }
 
