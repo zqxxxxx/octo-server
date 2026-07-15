@@ -12,7 +12,11 @@ package cardmsg
 import (
 	"encoding/json"
 	"fmt"
+	"math"
+	"regexp"
+	"strconv"
 	"strings"
+	"time"
 )
 
 const (
@@ -22,6 +26,15 @@ const (
 	MaxInputsBytes = 16 << 10
 )
 
+// jsonNumberPattern 是 RFC 8259 JSON 数字文法（= JS Number / bot 端 JSON 解析口径）：
+// 可选前导负号、整数部分无前导零、可选小数、可选指数。刻意**不**用 strconv.ParseFloat
+// 判定「是不是数字」：ParseFloat 接受 Go 专有文法——下划线分隔（"1_000"）、十六进制浮点
+// （"0x1p4"）、前导 "+"、前导零、裸 "NaN"/"Inf"——是 JSON/JS Number 的**超集**，会放行
+// bot 端 JSON 解析器拒绝或解读不同的串，造成「服务端判合法、bot 拿到的却是另一个数 / 解析
+// 失败」的静默数值错位。用严格文法先把服务端的「合法数字」钉到与 bot 收到的 JSON 一致的
+// 口径，再用 ParseFloat 求值兜溢出（PR#556 review）。
+var jsonNumberPattern = regexp.MustCompile(`^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][-+]?[0-9]+)?$`)
+
 // inputSpec 是生效帧里一个已声明 Input.* 元素的校验视图。
 type inputSpec struct {
 	typ         string
@@ -29,6 +42,10 @@ type inputSpec struct {
 	multiSelect bool                // isMultiSelect：值为逗号分隔子集（AC 线上格式）
 	valueOn     string              // Input.Toggle；缺省 "true"/"false"
 	valueOff    string
+	// Number/Date/Time 只校验格式，不采集 min/max —— 区间不服务端强制（PR#556 review：
+	// AC 规范把 min/max 定义为「可被客户端忽略的 hint」，合规客户端可提交越界值，而
+	// card/action 把错误折叠成单一 invalid，越界拒绝会让用户收到无从更正的笼统错；区间
+	// 校验下放 bot 业务逻辑，与 isRequired/regex 同）。
 }
 
 // ValidateInputs 按 D11 校验 card/action 请求的 inputs（fail-closed）：
@@ -36,6 +53,9 @@ type inputSpec struct {
 //   - 值必须是字符串；Input.Text ≤ 4KiB；Input.Toggle 必须等于 valueOn/valueOff；
 //     Input.ChoiceSet 必须命中声明的 choice value（multiSelect 为逗号分隔子集，
 //     单选允许 "" 表示未选择）；
+//   - P3-3：Input.Number 必须是合法 JSON 数字且有限；Input.Date 必须是 YYYY-MM-DD；
+//     Input.Time 必须是 HH:MM(24h)；三者 "" 均视为未填放行。min/max 区间**不**服务端
+//     强制（AC 规范定义为可忽略 hint，区间校验下放 bot，与 isRequired/regex 同）；
 //   - 序列化总量 ≤ 16KiB。
 //
 // envelopeRaw 是「生效卡片」信封字节（content_edit 优先，与 SubmitAction 的取帧
@@ -85,6 +105,46 @@ func ValidateInputs(envelopeRaw []byte, inputs map[string]interface{}) error {
 					return fmt.Errorf("%w: input %q 不是声明的选项", ErrCardInputInvalid, key)
 				}
 			}
+		case "Input.Number":
+			// 空串=未填（isRequired 不服务端强制）；否则必须匹配严格 JSON 数字文法。min/max
+			// 区间不服务端强制（下放 bot，见 inputSpec 注释）。
+			if s == "" {
+				break
+			}
+			// 先过严格 JSON 数字文法（见 jsonNumberPattern 注释：ParseFloat 的文法是 JSON/JS
+			// Number 的超集，会静默放行 bot 端解析不同的串）。
+			if !jsonNumberPattern.MatchString(s) {
+				return fmt.Errorf("%w: input %q 不是合法数字", ErrCardInputInvalid, key)
+			}
+			// 文法已排除 NaN/Inf 字面量与 Go 专有形态；ParseFloat 在此仅用于求值兜数值溢出
+			// （如 "1e999"→±Inf，返回 ErrRange）。非有限数不是合法数值输入，不得当「形状可信」
+			// 值透传给 bot（信任边界：格式/类型校验，与已下放 bot 的 range 无关）。
+			n, err := strconv.ParseFloat(s, 64)
+			if err != nil || math.IsNaN(n) || math.IsInf(n, 0) {
+				return fmt.Errorf("%w: input %q 不是有限数", ErrCardInputInvalid, key)
+			}
+		case "Input.Date":
+			// 空串=未填；否则必须是 YYYY-MM-DD。声明区间不服务端强制（同 Number）。
+			if s == "" {
+				break
+			}
+			if !isValidDate(s) {
+				return fmt.Errorf("%w: input %q 不是合法日期(YYYY-MM-DD)", ErrCardInputInvalid, key)
+			}
+		case "Input.Time":
+			// 空串=未填；否则必须是 HH:MM(24h)。声明区间不服务端强制（同 Number）。
+			if s == "" {
+				break
+			}
+			if !isValidTime(s) {
+				return fmt.Errorf("%w: input %q 不是合法时间(HH:MM)", ErrCardInputInvalid, key)
+			}
+		default:
+			// 声明帧里出现「已白名单收集、但校验器无对应 case」的输入类型：fail-closed 拒。
+			// 当前不可达——collectInputSpecs 只从 isInputElement（inputElements）收集，六类都
+			// 有 case——但显式兜底防止未来往 inputElements 加类型却漏加 case 时退化成 fail-open
+			// （「已声明即放行任意值」的天窗）。与信任边界「未覆盖即拒」一致（PR#556 review）。
+			return fmt.Errorf("%w: input %q 类型 %q 无值校验", ErrCardInputInvalid, key, spec.typ)
 		}
 	}
 	return nil
@@ -114,9 +174,12 @@ func collectInputSpecsFromElements(items []interface{}, specs map[string]inputSp
 			continue
 		}
 		t, _ := el["type"].(string)
-		if t == "Input.Text" || t == "Input.Toggle" || t == "Input.ChoiceSet" {
+		if isInputElement(t) {
 			if id, _ := el["id"].(string); id != "" {
 				spec := inputSpec{typ: t}
+				// 仅 Toggle/ChoiceSet 需采集额外声明（valueOn/off、choices、multiSelect）；
+				// Text/Number/Date/Time 只需 typ（提交期值校验只看格式，不采集 min/max —— 区间
+				// 不服务端强制，见 inputSpec 注释），故无 case。
 				switch t {
 				case "Input.Toggle":
 					spec.valueOn, spec.valueOff = "true", "false"
@@ -142,9 +205,10 @@ func collectInputSpecsFromElements(items []interface{}, specs map[string]inputSp
 				specs[id] = spec
 			}
 		}
-		// items/columns 仅对容器类递归，与 Validate 一致（叶子元素的 items/columns
-		// 发送期不被遍历，派发侧也不得把其中的 input id 当作「已声明」，否则 D11 声明面
-		// > 校验面 —— 与 findSubmitInElements 同口径）。
+		// items/columns/cells 仅对容器类递归，与 Validate / findSubmitInElements 完全一致
+		// （叶子元素的 items 发送期不被遍历，采集侧也不得把其中的 input id 当作「已声明」，
+		// 否则声明面 > 校验面）。Table.rows→cells→items 同样承载标准元素（含 Input.*），必须
+		// 递归 —— 否则 Table 单元格内的输入发送/派发都通过、提交却被当「未声明」拒（PR#556）。
 		switch t {
 		case "Container":
 			if sub, ok := el["items"].([]interface{}); ok {
@@ -160,6 +224,45 @@ func collectInputSpecsFromElements(items []interface{}, specs map[string]inputSp
 					}
 				}
 			}
+		case "Table":
+			if rows, ok := el["rows"].([]interface{}); ok {
+				for _, r := range rows {
+					row, ok := r.(map[string]interface{})
+					if !ok {
+						continue
+					}
+					cells, ok := row["cells"].([]interface{})
+					if !ok {
+						continue
+					}
+					for _, c := range cells {
+						if cell, ok := c.(map[string]interface{}); ok {
+							if sub, ok := cell["items"].([]interface{}); ok {
+								collectInputSpecsFromElements(sub, specs)
+							}
+						}
+					}
+				}
+			}
 		}
 	}
+}
+
+// isValidDate 校验 AC Input.Date 线上值格式（严格 YYYY-MM-DD + 真实日历日）。
+// 先卡定宽/分隔位（拒非零填充如 "2026-7-9"），再用 time.Parse 拒非法日历日（如 13 月）。
+func isValidDate(s string) bool {
+	if len(s) != 10 || s[4] != '-' || s[7] != '-' {
+		return false
+	}
+	_, err := time.Parse("2006-01-02", s)
+	return err == nil
+}
+
+// isValidTime 校验 AC Input.Time 线上值格式（严格 HH:MM 24h）。
+func isValidTime(s string) bool {
+	if len(s) != 5 || s[2] != ':' {
+		return false
+	}
+	_, err := time.Parse("15:04", s)
+	return err == nil
 }

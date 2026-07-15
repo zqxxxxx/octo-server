@@ -68,15 +68,18 @@ func findSubmitInElements(items []interface{}, actionID string) (map[string]inte
 		if d, ok := findSubmitAction(el["selectAction"], actionID); ok {
 			return d, true
 		}
-		// inlineAction：仅 Input.*（发送期只在 Input 分支校验），派发面 ≤ 校验面。
-		if t == "Input.Text" || t == "Input.Toggle" || t == "Input.ChoiceSet" {
+		// inlineAction：仅 Input.*（发送期只在输入分支校验）。派发面用与校验器同一个
+		// isInputElement 谓词，保证「校验面 == 派发面」—— 否则 Input.Number/Date/Time 的
+		// inlineAction Submit 会「发送通过、点击 not-found」死按钮（P3-3）。
+		if isInputElement(t) {
 			if d, ok := findSubmitAction(el["inlineAction"], actionID); ok {
 				return d, true
 			}
 		}
-		// items/columns 仅对容器类递归，与 Validate 完全一致（发送期只有 Container 递归
-		// items、ColumnSet 递归 columns→Column.items）——否则藏在叶子 items[] 下的
-		// Submit 会「派发可解析、发送期没校验」（PR#548 review：派发面必须 ≤ 校验面）。
+		// 容器/动作面递归，与 Validate 完全一致（发送期递归的位置：Container.items、
+		// ColumnSet→Column.items、以及 P3-3 Tier 1 的 Table→cells.items、ActionSet.actions、
+		// ImageSet.images[].selectAction、RichTextBlock.inlines[].selectAction）——否则藏在
+		// 未遍历位置的 Submit 会「派发可解析、发送期没校验」，或反之成为死按钮（派发面 == 校验面）。
 		switch t {
 		case "Container":
 			if sub, ok := el["items"].([]interface{}); ok {
@@ -97,6 +100,84 @@ func findSubmitInElements(items []interface{}, actionID string) (map[string]inte
 					if sub, ok := col["items"].([]interface{}); ok {
 						if d, ok := findSubmitInElements(sub, actionID); ok {
 							return d, true
+						}
+					}
+				}
+			}
+		case "ActionSet":
+			// P3-3 Tier 1：Submit 可出现在 body 的 ActionSet.actions（发送期 element() 走
+			// w.action 校验），派发侧对齐遍历。
+			if d, ok := findSubmitAction(el["actions"], actionID); ok {
+				return d, true
+			}
+		case "ImageSet":
+			// ImageSet.images[].selectAction 可载 Submit（发送期 imageChild 校验），对齐。
+			if imgs, ok := el["images"].([]interface{}); ok {
+				for _, it := range imgs {
+					if img, ok := it.(map[string]interface{}); ok {
+						// 派发面 == 校验面：非 Image 子元素发送期已拒，派发侧同 childTypeMatches 跳过，两面不漂移（PR#556 review P2）。
+						if !childTypeMatches(img, "Image") {
+							continue
+						}
+						if d, ok := findSubmitAction(img["selectAction"], actionID); ok {
+							return d, true
+						}
+					}
+				}
+			}
+		case "RichTextBlock":
+			// RichTextBlock.inlines[] 里的 TextRun.selectAction 可载 Submit（发送期校验），对齐。
+			if inls, ok := el["inlines"].([]interface{}); ok {
+				for _, it := range inls {
+					if inl, ok := it.(map[string]interface{}); ok {
+						// 同上：非 TextRun 内联对象发送期已拒，派发侧同判定跳过（PR#556 review P2）。
+						if !childTypeMatches(inl, "TextRun") {
+							continue
+						}
+						if d, ok := findSubmitAction(inl["selectAction"], actionID); ok {
+							return d, true
+						}
+					}
+				}
+			}
+		case "Table":
+			// Table rows→cells：行 selectAction + 单元格 selectAction + 递归 cell.items（与发送
+			// 期 Table 校验完全一致，派发面 == 校验面）。
+			if rows, ok := el["rows"].([]interface{}); ok {
+				for _, r := range rows {
+					row, ok := r.(map[string]interface{})
+					if !ok {
+						continue
+					}
+					// 非 TableRow 发送期已拒，派发侧同判定跳过（PR#556 review P2）。
+					if !childTypeMatches(row, "TableRow") {
+						continue
+					}
+					// 行级 selectAction 可载 Submit（发送期 w.selectAction(row) 已对齐校验，
+					// PR#556 review P2）。
+					if d, ok := findSubmitAction(row["selectAction"], actionID); ok {
+						return d, true
+					}
+					cells, ok := row["cells"].([]interface{})
+					if !ok {
+						continue
+					}
+					for _, c := range cells {
+						cell, ok := c.(map[string]interface{})
+						if !ok {
+							continue
+						}
+						// 非 TableCell 发送期已拒，派发侧同判定跳过（PR#556 review P2）。
+						if !childTypeMatches(cell, "TableCell") {
+							continue
+						}
+						if d, ok := findSubmitAction(cell["selectAction"], actionID); ok {
+							return d, true
+						}
+						if sub, ok := cell["items"].([]interface{}); ok {
+							if d, ok := findSubmitInElements(sub, actionID); ok {
+								return d, true
+							}
 						}
 					}
 				}
@@ -206,4 +287,32 @@ func decodeEnvelope(raw string) (map[string]interface{}, error) {
 		return nil, errors.New("cardmsg: 信封 JSON 尾部有多余数据")
 	}
 	return payload, nil
+}
+
+// Transient 读取信封可选的 transient 标记（P2 D10.4）。transient 帧照常应用到
+// content_edit（D6/D9 不变），但不进修订历史 —— 进度帧（thinking/tool-state）不
+// 淹没审批态变更。缺失/非布尔按 false（非 transient，入历史）。
+func Transient(payload map[string]interface{}) bool {
+	t, _ := payload["transient"].(bool)
+	return t
+}
+
+// TransientFromContentEdit 从编辑体 JSON 读取 transient。
+func TransientFromContentEdit(contentEdit string) bool {
+	var payload map[string]interface{}
+	if err := json.Unmarshal([]byte(contentEdit), &payload); err != nil {
+		return false
+	}
+	return Transient(payload)
+}
+
+// PlainFromContentEdit 从编辑体 JSON 读取服务端权威 plain（Finalize 重算后的值），
+// 供修订历史存列表摘要。缺失返回空串。
+func PlainFromContentEdit(contentEdit string) string {
+	var payload map[string]interface{}
+	if err := json.Unmarshal([]byte(contentEdit), &payload); err != nil {
+		return ""
+	}
+	s, _ := payload["plain"].(string)
+	return s
 }

@@ -21,6 +21,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkevent"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
+	"github.com/Mininglamp-OSS/octo-server/modules/botidentity"
 	"github.com/Mininglamp-OSS/octo-server/modules/channel"
 	chservice "github.com/Mininglamp-OSS/octo-server/modules/channel/service"
 	commonapi "github.com/Mininglamp-OSS/octo-server/modules/common"
@@ -32,6 +33,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardrevision"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/Mininglamp-OSS/octo-server/pkg/mentionrewrite"
@@ -203,6 +205,10 @@ func truncateRunes(s string, maxRunes int) string {
 	return s
 }
 
+type botIdentityResolver interface {
+	Resolve(uid string) (*botidentity.Identity, error)
+}
+
 // Message 消息相关API
 type Message struct {
 	ctx *config.Context
@@ -220,7 +226,10 @@ type Message struct {
 	pinnedDB            *pinnedDB
 	userService         user.IService
 	groupService        group.IService
-	// robotService 仅用于 GetCreatorUID (YUJ-60 允许 bot 创建者撤回自己 bot 发的消息)。
+	// botIdentity performs live sender authorization for card/action. It has no
+	// cache so App Bot unpublish/revocation takes effect on the next first action.
+	botIdentity botIdentityResolver
+	// robotService retains robot-specific owner, mention, and event-queue operations.
 	robotService   robot.IService
 	commonService  commonapi.IService
 	fileService    file.IService
@@ -228,6 +237,9 @@ type Message struct {
 	threadDB       *thread.DB
 	// cardClaims card/action 的 D4 幂等 claim 存储（card_action_claims.go）。
 	cardClaims *cardActionClaimStore
+	// cardRevisions D10 卡片修订历史 store（共享表 octo_message_card_revision；
+	// 此处读查询 + 撤回删除）。
+	cardRevisions *cardrevision.Store
 	// groupDB: 直查 group 表，区分"群不存在"和"群已解散"两种 404 情况，
 	// groupService.GetGroupWithGroupNo 把 nil 也包成 error 不便分辨。
 	groupDB  *group.DB
@@ -268,7 +280,8 @@ func New(ctx *config.Context) *Message {
 		remindersDB:         newRemindersDB(ctx),
 		pinnedDB:            newPinnedDB(ctx),
 		userService:         user.NewService(ctx),
-		// robotService: 只读 robot 服务，用于 hasRevokePermission 判断 bot 所有者。
+		botIdentity:         botidentity.New(ctx),
+		// robotService: robot owner/mention lookups and typed event enqueue.
 		robotService:   robot.NewService(ctx),
 		commonService:  commonapi.NewService(ctx),
 		fileService:    file.NewService(ctx),
@@ -276,6 +289,7 @@ func New(ctx *config.Context) *Message {
 		threadDB:       thread.NewDB(ctx),
 		groupDB:        group.NewDB(ctx),
 		cardClaims:     newCardActionClaimStore(ctx),
+		cardRevisions:  cardrevision.NewStore(ctx.DB()),
 		stopChan:       make(chan struct{}),
 	}
 	m.ctx.AddEventListener(event.GroupMemberAdd, m.handleGroupMemberAddEvent)
@@ -310,6 +324,7 @@ func (m *Message) Route(r *wkhttp.WKHttp) {
 		message.GET("/sync/sensitivewords", m.syncSensitiveWords) // 同步敏感词
 		message.POST("/edit", m.messageEdit)                      // 消息编辑
 		message.POST("/card/action", m.cardAction)                // 卡片动作上行（card-message-interaction P2 D3）
+		message.GET("/card/revisions", m.getCardRevisions)        // 卡片修订历史查询（P2 D10）
 		message.POST("/reminder/sync", m.reminderSync)            // 同步提醒
 		message.POST("/reminder/done", m.reminderDone)            // 提醒已处理完成
 		message.GET("/prohibit_words/sync", m.syncProhibitWords)  // 同步违禁词
@@ -2824,6 +2839,15 @@ func (m *Message) revoke(c *wkhttp.Context) {
 	}
 	if eventID > 0 {
 		m.ctx.EventCommit(eventID)
+	}
+	// P2 D10.7：撤回提交后立即删除卡片修订历史（best-effort）—— 必须在 SendRevoke
+	// 通知**之前**，否则通知失败提前返回会漏删，DB 已标撤回却留下可查询内容历史。
+	// 非卡片消息为 no-op。查询端另有 revoke/deleted 可见性兜底（isCardMessageWithdrawn），
+	// 两层都在，删除失败也不会泄漏。
+	if cardmsg.IsCardRawPayload(message.Payload) {
+		if derr := m.cardRevisions.DeleteByMessageID(messageIDStr); derr != nil {
+			m.Error("撤回卡片时删除修订历史失败(不影响撤回;查询端有可见性兜底)", zap.Error(derr), zap.String("messageID", messageIDStr))
+		}
 	}
 	for _, msgID := range msgIds {
 		messageIDI, _ := strconv.ParseInt(msgID, 10, 64)

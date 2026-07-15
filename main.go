@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/module"
 	libdb "github.com/Mininglamp-OSS/octo-lib/pkg/db"
@@ -19,12 +20,16 @@ import (
 	libwkhttp "github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-lib/server"
 	_ "github.com/Mininglamp-OSS/octo-server/internal"
+	"github.com/Mininglamp-OSS/octo-server/internal/carddispatch"
 	commonapi "github.com/Mininglamp-OSS/octo-server/modules/base/common"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
+	"github.com/Mininglamp-OSS/octo-server/modules/botidentity"
+	"github.com/Mininglamp-OSS/octo-server/modules/notify"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/pkg/accesslog"
 	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
 	"github.com/Mininglamp-OSS/octo-server/pkg/avatarrender"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	octodb "github.com/Mininglamp-OSS/octo-server/pkg/db"
 	octoi18n "github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/Mininglamp-OSS/octo-server/pkg/metrics"
@@ -220,6 +225,13 @@ func runAPI(ctx *config.Context) {
 	// 由 sticker 模块在 New() 时落值——策略源在 system_setting(common 模块),故不在此组合根
 	// 设置,避免反向依赖 modules/sticker。
 	metrics.NewStickerMetrics(prometheus.DefaultRegisterer)
+	// Install the one process registry before register.GetModules constructs
+	// module instances. The foundation rollout deliberately has no production
+	// producer registrations; later enablement injects only a bound Sender into
+	// its owning module after the cross-repository route/contract gates pass.
+	if err := installCardDispatch(ctx); err != nil {
+		panic(fmt.Errorf("install internal card dispatch registry: %w", err))
+	}
 	// 构造进程级共享头像渲染缓存,并把观测 hooks 接到上面注册的头像指标。所有头像端点
 	// (user 的 UserAvatar;群组头像渲染合并后亦然——#478)经 avatarrender.GetOrRender
 	// 共用这一个实例:共享 LRU + 同一个渲染信号量(后者唯一,才是真正的进程级渲染并发
@@ -333,6 +345,56 @@ func runAPI(ctx *config.Context) {
 		panic(err)
 	}
 }
+
+func installCardDispatch(ctx *config.Context) error {
+	deps := carddispatch.Dependencies{
+		IdentityResolver: botidentity.New(ctx),
+		Authorizer:       carddispatch.NewDBAuthorizer(ctx.DB()),
+		Transport:        ctx,
+		Metrics:          carddispatch.NewMetrics(prometheus.DefaultRegisterer),
+		Logger:           log.NewTLog("CardDispatch"),
+	}
+	registry := carddispatch.NewRegistry(deps, cardDispatchProducerSpecs())
+	return carddispatch.Install(ctx, registry)
+}
+
+func cardDispatchProducerSpecs() []carddispatch.ProducerSpec {
+	// Every producer here shares the same shape (existing `notification` User
+	// Bot, DM-only, display-only octo/v1, system-notification Space policy,
+	// in-flight 20/process; brief › pilot table, all rows confirmed
+	// 2026-07-13). modules/notify obtains each producer's bound Sender via
+	// carddispatch.SenderFromContext.
+	//
+	// Registrations are inert until modules/notify receives a matching
+	// structured card request (NotifyReq.Card or NotifyReq.DocsCard) AND
+	// OCTO_CARD_MESSAGE_ENABLED is on. End-to-end enablement of a producer
+	// additionally depends on octo-web shipping the matching deep-link route
+	// (/s/:taskId for summary — not yet on main; /d/:docId for docs — already
+	// live) and the caller-side switching from text payloads to structured
+	// fields.
+	base := carddispatch.ProducerSpec{
+		Enabled:             true,
+		SenderUID:           notify.NotifyBotUIDValue,
+		AllowedChannelTypes: []uint8{common.ChannelTypePerson.Uint8()},
+		AllowedProfiles:     []string{cardmsg.ProfileV1},
+		SpacePolicy:         carddispatch.SpacePolicySystemNotification,
+		GroupPolicy:         carddispatch.GroupPolicyMemberRequired, // unused at DM pilot; must be a valid value
+		MaxInFlight:         20,
+	}
+	summarySpec := base
+	summarySpec.ID = summaryNotifyProducerID
+	docsSpec := base
+	docsSpec.ID = docsNotifyProducerID
+	return []carddispatch.ProducerSpec{summarySpec, docsSpec}
+}
+
+// {summaryNotify,docsNotify}ProducerID mirror modules/notify's producer IDs.
+// Kept here so the composition root can register the spec without importing an
+// unexported const.
+const (
+	summaryNotifyProducerID = carddispatch.ProducerID("summary-notify")
+	docsNotifyProducerID    = carddispatch.ProducerID("docs-notify")
+)
 
 func printServerInfo(ctx *config.Context) {
 	infoStr := `

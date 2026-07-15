@@ -156,6 +156,17 @@ var systemSettingSchema = []settingDef{
 	{Category: "docs", Key: "enabled", Type: settingTypeBool, Description: "是否向客户端展示文档(docs)模块入口（octo-docs-backend 上线前默认关闭）",
 		Effective: func(s *SystemSettings) string { return boolToCanonical(s.DocsEnabled()) }},
 
+	// Loop(回路)模块展示开关。loop 依赖后端服务 + fleet 代理 + daemon runtime 一整套,未就绪前
+	// 默认关闭;feature 分支合入 main 也不暴露,上线后由管理台切 dmloop.enabled 灰度放量。仅表达
+	// 展示策略,不承担服务端鉴权(/fleet 鉴权在后端)。经 GET /v1/common/appconfig 的 dmloop_on 下发给客户端。
+	{Category: "dmloop", Key: "enabled", Type: settingTypeBool, Description: "是否向客户端展示 Loop(回路)模块入口（后端服务上线前默认关闭）",
+		Effective: func(s *SystemSettings) string { return boolToCanonical(s.DmloopEnabled()) }},
+
+	// 「我的 / 运行时」模块展示开关。与 dmloop.enabled 分开:「我的」后续会重新设计、脱离
+	// loop 独立演进,故独立门控以便分阶段放量。默认关闭。经 appconfig 的 dmpersonal_on 下发。
+	{Category: "dmpersonal", Key: "enabled", Type: settingTypeBool, Description: "是否向客户端展示「我的/运行时」模块入口（默认关闭；与 dmloop 分开以便独立放量）",
+		Effective: func(s *SystemSettings) string { return boolToCanonical(s.DmpersonalEnabled()) }},
+
 	// 自定义贴纸上传限制（sticker-upload-compression 任务）。原先硬编码在
 	// modules/file/const.go；挪进 system_setting 后可灰度/回滚，且每键都有
 	// 服务端硬上限（stickerUpload*HardCap / stickerCompress*HardCap），误配也不会
@@ -183,6 +194,12 @@ var systemSettingSchema = []settingDef{
 		Effective: func(s *SystemSettings) string { return strconv.Itoa(s.StickerCompressMaxConcurrency()) }},
 	{Category: "sticker", Key: "compress_timeout_ms", Type: settingTypeInt, Description: "单次贴纸压缩超时(毫秒)；超时该请求跳过压缩走原路径(fail-open)；硬上限 10000，默认 2000", Positive: true,
 		Effective: func(s *SystemSettings) string { return strconv.Itoa(s.StickerCompressTimeoutMs()) }},
+	// compress_max_dimension 是压缩缩放目标边长(仅静态 jpg/png)：压缩开启后，大于此
+	// 边长的静态图等比缩小到此值再重编码落库。默认 512 —— 让「>512 缩到 512」成为压缩
+	// 开启后的开箱行为。维度门对 jpg/png 在压缩开启时放宽到硬上限 1024(随后缩到此值)，
+	// gif/webp 及压缩关闭时仍受 upload_max_dimension 约束。硬上限 1024。
+	{Category: "sticker", Key: "compress_max_dimension", Type: settingTypeInt, Description: "贴纸压缩缩放目标边长(px，仅静态 jpg/png)；压缩开启后大于此值等比缩小再存；硬上限 1024，默认 512。建议 ≤ upload_max_dimension，否则压后仍超 upload_max_dimension 的图会被 fail-closed 拒绝", Positive: true,
+		Effective: func(s *SystemSettings) string { return strconv.Itoa(s.StickerCompressMaxDimension()) }},
 
 	// Email server config — formerly yaml-only (Support.* in config.go).
 	{Category: "support", Key: "email", Type: settingTypeString, Description: "技术支持邮箱（发件人）",

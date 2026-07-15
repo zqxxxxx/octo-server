@@ -113,7 +113,7 @@ func TestValidateWhitelistRejections(t *testing.T) {
 		want error
 	}{
 		{"Input.Text 元素", cardWithBody(map[string]interface{}{"type": "Input.Text", "id": "x"}), ErrCardUnknownElement},
-		{"Table 元素(1.6)", cardWithBody(map[string]interface{}{"type": "Table"}), ErrCardUnknownElement},
+		{"Media 元素(未支持,AC1.1)", cardWithBody(map[string]interface{}{"type": "Media"}), ErrCardUnknownElement},
 		{"Action.Submit", map[string]interface{}{"body": []interface{}{}, "actions": []interface{}{
 			map[string]interface{}{"type": "Action.Submit", "title": "OK"},
 		}}, ErrCardUnknownAction},
@@ -124,7 +124,12 @@ func TestValidateWhitelistRejections(t *testing.T) {
 			"type":         "Container",
 			"selectAction": map[string]interface{}{"type": "Action.Submit", "data": map[string]interface{}{}},
 		}), ErrCardUnknownAction},
-		{"ActionSet 不在白名单", cardWithBody(map[string]interface{}{"type": "ActionSet"}), ErrCardUnknownElement},
+		// Action.ToggleVisibility 现为 octo/v1 本地动作（见 local_actions_test.go 正/反用例）；
+		// 缺 targetElements 时按结构非法拒（不再是「未知动作」）。
+		{"Action.ToggleVisibility 缺 targetElements", cardWithBody(map[string]interface{}{
+			"type":         "Container",
+			"selectAction": map[string]interface{}{"type": "Action.ToggleVisibility"},
+		}), ErrCardBadShape},
 	} {
 		if err := Validate(envelope(tc.card)); !errors.Is(err, tc.want) {
 			t.Errorf("%s: err=%v want %v", tc.name, err, tc.want)
