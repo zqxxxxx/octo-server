@@ -36,6 +36,18 @@ type dispatchCapture struct {
 	captured *config.MsgSendReq
 }
 
+func TestMsgSendReqWithClientMsgNoSerializesTopLevelIdempotencyKey(t *testing.T) {
+	raw, err := json.Marshal(msgSendReqWithClientMsgNo{
+		MsgSendReq:  &config.MsgSendReq{ChannelID: "group-1", ChannelType: 2, Payload: []byte(`{"type":17}`)},
+		ClientMsgNo: "loop_frame_1",
+	})
+	assert.NoError(t, err)
+	var body map[string]any
+	assert.NoError(t, json.Unmarshal(raw, &body))
+	assert.Equal(t, "loop_frame_1", body["client_msg_no"])
+	assert.Equal(t, "group-1", body["channel_id"])
+}
+
 func (d *dispatchCapture) hook(req *config.MsgSendReq) (*config.MsgSendResp, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()

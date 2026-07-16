@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -17,13 +18,16 @@ import (
 // validCard returns a minimal well-formed completed card request field set.
 func validCard() *SummaryCardFields {
 	return &SummaryCardFields{
+		TaskID:      42,
 		TaskNo:      "TN_abcd",
+		SummaryMode: 1,
 		Kind:        SummaryCardKindCompleted,
 		Title:       "产品周会纪要",
 		TimeRange:   "2026-07-06 10:00 ~ 2026-07-13 10:00",
 		Members:     5,
 		MsgCount:    128,
 		GeneratedAt: "2026-07-13 15:04",
+		Content:     "**关键结论**\n\n" + strings.Repeat("- 转化率提升 18%，下周继续验证新的落地页方案。\n", 20),
 	}
 }
 
@@ -58,9 +62,10 @@ func TestDeliverCardNotification_ValidationRejectsBadFields(t *testing.T) {
 		"missing card":    {SpaceID: "s", Targets: []string{"u"}},
 		"missing space":   {Targets: []string{"u"}, Card: validCard()},
 		"empty targets":   {SpaceID: "s", Targets: nil, Card: validCard()},
-		"missing task_no": {SpaceID: "s", Targets: []string{"u"}, Card: &SummaryCardFields{Kind: SummaryCardKindCompleted, Title: "t"}},
-		"missing title":   {SpaceID: "s", Targets: []string{"u"}, Card: &SummaryCardFields{TaskNo: "n", Kind: SummaryCardKindCompleted}},
-		"unknown kind":    {SpaceID: "s", Targets: []string{"u"}, Card: &SummaryCardFields{TaskNo: "n", Kind: "weird", Title: "t"}},
+		"missing task_id": {SpaceID: "s", Targets: []string{"u"}, Card: &SummaryCardFields{TaskNo: "n", Kind: SummaryCardKindCompleted, Title: "t"}},
+		"missing task_no": {SpaceID: "s", Targets: []string{"u"}, Card: &SummaryCardFields{TaskID: 1, Kind: SummaryCardKindCompleted, Title: "t"}},
+		"missing title":   {SpaceID: "s", Targets: []string{"u"}, Card: &SummaryCardFields{TaskID: 1, TaskNo: "n", Kind: SummaryCardKindCompleted}},
+		"unknown kind":    {SpaceID: "s", Targets: []string{"u"}, Card: &SummaryCardFields{TaskID: 1, TaskNo: "n", Kind: "weird", Title: "t"}},
 	}
 	for name, req := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -97,8 +102,15 @@ func TestBuildSummaryCard_ProducesValidOctoV1(t *testing.T) {
 				"card":         cardObj,
 			}
 			require.NoError(t, cardmsg.Validate(envelope), "template output must pass octo/v1 Validate")
-			// Deep link built from WebLoginURL origin only, /s/{task_no}?sp={space}.
-			assert.Contains(t, string(doc), "https://im.example.com/s/TN_abcd?sp=spc_1")
+			// Deep link built from WebLoginURL origin only, /s/{task_id}?sp={space}.
+			assert.Contains(t, string(doc), "https://im.example.com/s/42?sp=spc_1")
+			if kind == SummaryCardKindCompleted {
+				assert.Contains(t, string(doc), "Action.ToggleVisibility")
+				assert.Contains(t, string(doc), "summary-full")
+				assert.Contains(t, string(doc), "进入群总结")
+			} else {
+				assert.NotContains(t, string(doc), "summary-full")
+			}
 			assert.NotContains(t, string(doc), "/login")
 		})
 	}
@@ -122,7 +134,7 @@ func TestBuildSummaryFallbackText(t *testing.T) {
 	assert.Contains(t, completed, "参与成员：5 人")
 	assert.Contains(t, completed, "消息数量：128 条")
 
-	failed := &SummaryCardFields{TaskNo: "n", Kind: SummaryCardKindFailed, Title: "周报", Reason: "超时"}
+	failed := &SummaryCardFields{TaskID: 1, TaskNo: "n", Kind: SummaryCardKindFailed, Title: "周报", Reason: "超时"}
 	text := buildSummaryFallbackText(failed, "zh-CN")
 	assert.Contains(t, text, "你的总结「周报」生成失败。")
 	assert.Contains(t, text, "失败原因：超时")

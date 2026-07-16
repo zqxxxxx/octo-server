@@ -16,10 +16,11 @@ import (
 )
 
 const (
-	MaxExcerptRunes = 300
-	maxFacts        = 20
-	maxTitleRunes   = 200
-	maxFactRunes    = 500
+	MaxExcerptRunes        = 300
+	MaxSummaryContentRunes = 6000
+	maxFacts               = 20
+	maxTitleRunes          = 200
+	maxFactRunes           = 500
 )
 
 type Fact struct {
@@ -32,8 +33,15 @@ type ResourceCard struct {
 	Title       string
 	Attribution string
 	Excerpt     string
-	Facts       []Fact
-	CopyText    string
+	// Content is the optional full Summary body. When it exceeds the preview
+	// limit the template emits separate preview/full containers controlled by
+	// Action.ToggleVisibility; other ResourceCard users leave it empty.
+	Content  string
+	Facts    []Fact
+	CopyText string
+	// PrimaryActionTitle overrides the localized generic "View details" label.
+	// Producers use it when the destination has a domain-specific name.
+	PrimaryActionTitle string
 	// Variant is the stable, low-cardinality identifier the renderer / client
 	// can key off to style card families independently (e.g. "summary.completed",
 	// "summary.failed", "docs.shared", "docs.commented"). Emitted into
@@ -130,6 +138,9 @@ func buildResourceCard(
 	if len(resource.CopyText) > cardmsg.MaxCopyTextBytes {
 		return nil, errors.New("cardtmpl: copy text too large")
 	}
+	if utf8.RuneCountInString(resource.PrimaryActionTitle) > maxTitleRunes {
+		return nil, errors.New("cardtmpl: primary action title too long")
+	}
 	// The icon is optional; when present it must be an absolute https URL (the
 	// same positive-allowlist rule cardmsg.Validate re-checks). An empty icon
 	// simply omits the leading image column.
@@ -190,7 +201,23 @@ func buildResourceCard(
 		header = map[string]interface{}{"type": "Container", "items": titleItems}
 	}
 	body := []interface{}{header}
-	if excerpt := truncateRunes(strings.TrimSpace(resource.Excerpt), MaxExcerptRunes); excerpt != "" {
+	if content := truncateRunes(strings.TrimSpace(resource.Content), MaxSummaryContentRunes); content != "" {
+		preview := truncateRunes(content, MaxExcerptRunes)
+		if preview != content {
+			body = append(body,
+				map[string]interface{}{
+					"type": "Container", "id": "summary-preview", "isVisible": true,
+					"items": []interface{}{map[string]interface{}{"type": "TextBlock", "text": preview, "wrap": true}},
+				},
+				map[string]interface{}{
+					"type": "Container", "id": "summary-full", "isVisible": false,
+					"items": []interface{}{map[string]interface{}{"type": "TextBlock", "text": content, "wrap": true}},
+				},
+			)
+		} else {
+			body = append(body, map[string]interface{}{"type": "TextBlock", "text": content, "wrap": true})
+		}
+	} else if excerpt := truncateRunes(strings.TrimSpace(resource.Excerpt), MaxExcerptRunes); excerpt != "" {
 		body = append(body, map[string]interface{}{
 			"type": "TextBlock",
 			"text": escapeMarkdown(excerpt),
@@ -207,15 +234,39 @@ func buildResourceCard(
 		}
 		body = append(body, map[string]interface{}{"type": "FactSet", "facts": facts})
 	}
+	actionTitle := strings.TrimSpace(resource.PrimaryActionTitle)
+	if actionTitle == "" {
+		actionTitle = labels.viewDetails
+	}
 	actions := []interface{}{
-		map[string]interface{}{"type": "Action.OpenUrl", "title": labels.viewDetails, "url": deepLink},
+		map[string]interface{}{"type": "Action.OpenUrl", "title": actionTitle, "url": deepLink},
 	}
 	if resource.CopyText != "" {
 		actions = append(actions, map[string]interface{}{
 			"type": "Action.CopyToClipboard", "title": labels.copy, "text": resource.CopyText,
 		})
 	}
-	body = append(body, map[string]interface{}{"type": "ActionSet", "actions": actions})
+	content := truncateRunes(strings.TrimSpace(resource.Content), MaxSummaryContentRunes)
+	if content != "" && truncateRunes(content, MaxExcerptRunes) != content {
+		expandActions := append([]interface{}{
+			map[string]interface{}{
+				"type": "Action.ToggleVisibility", "title": labels.expand,
+				"targetElements": summaryVisibilityTargets(false, true, false, true),
+			},
+		}, actions...)
+		collapseActions := append([]interface{}{
+			map[string]interface{}{
+				"type": "Action.ToggleVisibility", "title": labels.collapse,
+				"targetElements": summaryVisibilityTargets(true, false, true, false),
+			},
+		}, actions...)
+		body = append(body,
+			map[string]interface{}{"type": "ActionSet", "id": "summary-expand-actions", "isVisible": true, "actions": expandActions},
+			map[string]interface{}{"type": "ActionSet", "id": "summary-collapse-actions", "isVisible": false, "actions": collapseActions},
+		)
+	} else {
+		body = append(body, map[string]interface{}{"type": "ActionSet", "actions": actions})
+	}
 
 	document := map[string]interface{}{
 		"type":     "AdaptiveCard",
@@ -228,6 +279,15 @@ func buildResourceCard(
 		return nil, fmt.Errorf("cardtmpl: marshal resource card: %w", err)
 	}
 	return json.RawMessage(raw), nil
+}
+
+func summaryVisibilityTargets(preview, full, expand, collapse bool) []interface{} {
+	return []interface{}{
+		map[string]interface{}{"elementId": "summary-preview", "isVisible": preview},
+		map[string]interface{}{"elementId": "summary-full", "isVisible": full},
+		map[string]interface{}{"elementId": "summary-expand-actions", "isVisible": expand},
+		map[string]interface{}{"elementId": "summary-collapse-actions", "isVisible": collapse},
+	}
 }
 
 func summaryDeepLink(webLoginURL, taskID, spaceID string) (string, error) {
@@ -330,11 +390,13 @@ func escapeMarkdown(value string) string {
 type localizedLabels struct {
 	viewDetails string
 	copy        string
+	expand      string
+	collapse    string
 }
 
 func labelsForLanguage(lang string) localizedLabels {
 	if strings.EqualFold(lang, "zh-CN") || strings.HasPrefix(strings.ToLower(lang), "zh-") {
-		return localizedLabels{viewDetails: "查看详情", copy: "复制"}
+		return localizedLabels{viewDetails: "查看详情", copy: "复制", expand: "展开全文", collapse: "收起"}
 	}
-	return localizedLabels{viewDetails: "View details", copy: "Copy"}
+	return localizedLabels{viewDetails: "View details", copy: "Copy", expand: "Show more", collapse: "Show less"}
 }

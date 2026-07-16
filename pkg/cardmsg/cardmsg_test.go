@@ -477,6 +477,27 @@ func TestBuildPlainDerivation(t *testing.T) {
 	}
 }
 
+func TestBuildPlainSkipsInitiallyHiddenToggleContent(t *testing.T) {
+	card := map[string]interface{}{
+		"body": []interface{}{
+			map[string]interface{}{"type": "Container", "id": "preview", "items": []interface{}{
+				map[string]interface{}{"type": "TextBlock", "text": "摘要预览"},
+			}},
+			map[string]interface{}{"type": "Container", "id": "full", "isVisible": false, "items": []interface{}{
+				map[string]interface{}{"type": "TextBlock", "text": "不应进入初始 plain 的完整正文"},
+			}},
+			map[string]interface{}{"type": "ColumnSet", "columns": []interface{}{
+				map[string]interface{}{"type": "Column", "isVisible": false, "items": []interface{}{
+					map[string]interface{}{"type": "TextBlock", "text": "隐藏列"},
+				}},
+			}},
+		},
+	}
+	if got := BuildPlain(card); got != "摘要预览" {
+		t.Fatalf("BuildPlain must reflect initial visibility, got %q", got)
+	}
+}
+
 // 验收(PR#543 round-5 🟡):stripMarkdown 走 goldmark 后,旧正则漏剥的形态
 // (引用式链接 / autolink / 图片)不得把原始 markdown 语法泄进权威 plain。
 func TestStripMarkdownRenderForms(t *testing.T) {

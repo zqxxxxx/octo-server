@@ -12,6 +12,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/network"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
@@ -23,6 +24,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/richtext"
 	"github.com/go-sql-driver/mysql"
 	"github.com/gocraft/dbr/v2"
+	"github.com/tidwall/gjson"
 	"go.uber.org/zap"
 )
 
@@ -31,6 +33,9 @@ type BotSendMessageReq struct {
 	ChannelID   string `json:"channel_id"`
 	ChannelType uint8  `json:"channel_type"`
 	StreamNo    string `json:"stream_no"`
+	// ClientMsgNo is the caller's stable wire idempotency key. It is optional
+	// for legacy sends and required by durable server-authored card workers.
+	ClientMsgNo string `json:"client_msg_no,omitempty"`
 	// OnBehalfOf — YUJ-1166 / Mininglamp-OSS/octo-server#81 (Persona Clone v0).
 	// When non-empty the bot is asking to dispatch as the real user
 	// `OnBehalfOf`. Server validates an active OBO grant
@@ -50,6 +55,13 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 		respondBotAPIRequestInvalid(c, "")
 		return
 	}
+	ba.sendMessageRequest(c, req)
+}
+
+// sendMessageRequest is shared by the generic endpoint and reviewed
+// server-authored card endpoints. All existing identity, target permission,
+// finalization, size, and transport checks remain centralized here.
+func (ba *BotAPI) sendMessageRequest(c *wkhttp.Context, req BotSendMessageReq) {
 	if strings.TrimSpace(req.ChannelID) == "" {
 		respondBotAPIRequestInvalid(c, "channel_id")
 		return
@@ -60,6 +72,10 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 	}
 	if len(req.Payload) == 0 {
 		respondBotAPIRequestInvalid(c, "payload")
+		return
+	}
+	if req.ClientMsgNo != strings.TrimSpace(req.ClientMsgNo) || len(req.ClientMsgNo) > 64 {
+		respondBotAPIRequestInvalid(c, "client_msg_no")
 		return
 	}
 	// PR#82 review #2 P1-2 + PR#121 R2 + PR#121 R3 — reject any
@@ -302,7 +318,7 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 		FromUID:     fromUID,
 		Payload:     []byte(util.ToJson(wirePayload)),
 	}
-	result, err := ba.dispatchMsgSendReq(msgReq)
+	result, err := ba.dispatchMsgSendReqWithClientMsgNo(msgReq, req.ClientMsgNo)
 	if err != nil {
 		ba.Error("发送消息失败", zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrBotAPISendFailed, nil, nil)
@@ -313,6 +329,130 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 	ba.clearTypingThrottle(robotID, channelID, req.ChannelType)
 
 	c.Response(result)
+}
+
+type msgSendReqWithClientMsgNo struct {
+	*config.MsgSendReq
+	ClientMsgNo string `json:"client_msg_no"`
+}
+
+// dispatchMsgSendReqWithClientMsgNo preserves the existing dispatch path for
+// legacy sends and adds the WuKongIM top-level client_msg_no field for durable
+// retries. octo-lib does not yet expose that request field, so the non-empty
+// path serializes the same request locally through the public IM config.
+func (ba *BotAPI) dispatchMsgSendReqWithClientMsgNo(req *config.MsgSendReq, clientMsgNo string) (*config.MsgSendResp, error) {
+	if clientMsgNo == "" || ba.dispatchOverride != nil {
+		return ba.dispatchMsgSendReq(req)
+	}
+	if ba.ctx == nil || ba.ctx.GetConfig() == nil {
+		return nil, errors.New("IM dispatch context is unavailable")
+	}
+	cfg := ba.ctx.GetConfig()
+	// WuKongIM's client_msg_no is a client-side display dedup key, not a
+	// storage idempotency key: repeated /message/send calls can append multiple
+	// rows. Durable group/thread workers therefore preflight the canonical row
+	// and skip dispatch entirely when a previous attempt already persisted it.
+	if req.ChannelType != common.ChannelTypePerson.Uint8() {
+		canonical, found, lookupErr := ba.findPersistedMessageByClientMsgNo(req.ChannelID, req.ChannelType, req.FromUID, clientMsgNo)
+		if lookupErr != nil {
+			return nil, lookupErr
+		}
+		if found {
+			return canonical, nil
+		}
+	}
+	wire := msgSendReqWithClientMsgNo{MsgSendReq: req, ClientMsgNo: clientMsgNo}
+	resp, err := network.Post(cfg.WuKongIM.APIURL+"/message/send", []byte(util.ToJson(wire)), cfg.WuKongIMManagerTokenHeaderMap())
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("IM服务[SendMessage]返回状态[%d]失败！", resp.StatusCode)
+	}
+	data := gjson.Get(resp.Body, "data")
+	sent := &config.MsgSendResp{
+		MessageID: data.Get("message_id").Int(), MessageSeq: uint32(data.Get("message_seq").Uint()),
+		ClientMsgNo: data.Get("client_msg_no").String(),
+	}
+	// WuKongIM deduplicates the visible message by client_msg_no, but a retry
+	// still receives a newly allocated (and never persisted) message_id from
+	// /message/send. Returning that transient id would make a durable worker
+	// overwrite its edit anchor with a message that cannot be queried later.
+	// Resolve the canonical persisted row before acknowledging non-DM durable
+	// sends. Loop cards only target groups/threads, whose channel id is already
+	// the storage channel id accepted by /message/byclientmsgno.
+	if req.ChannelType != common.ChannelTypePerson.Uint8() {
+		canonical, lookupErr := ba.lookupPersistedMessageByClientMsgNo(req.ChannelID, req.ChannelType, req.FromUID, clientMsgNo)
+		if lookupErr != nil {
+			return nil, lookupErr
+		}
+		return canonical, nil
+	}
+	return sent, nil
+}
+
+func (ba *BotAPI) lookupPersistedMessageByClientMsgNo(channelID string, channelType uint8, fromUID, clientMsgNo string) (*config.MsgSendResp, error) {
+	if ba.ctx == nil || ba.ctx.GetConfig() == nil {
+		return nil, errors.New("IM lookup context is unavailable")
+	}
+	var lastStatus int
+	for attempt := 0; attempt < 30; attempt++ {
+		persisted, found, err := ba.findPersistedMessageByClientMsgNo(channelID, channelType, fromUID, clientMsgNo)
+		if err != nil {
+			return nil, err
+		}
+		if found {
+			return persisted, nil
+		}
+		lastStatus = http.StatusNotFound
+		time.Sleep(50 * time.Millisecond)
+	}
+	return nil, fmt.Errorf("persisted IM message did not become readable (last status %d)", lastStatus)
+}
+
+func (ba *BotAPI) findPersistedMessageByClientMsgNo(channelID string, channelType uint8, fromUID, clientMsgNo string) (*config.MsgSendResp, bool, error) {
+	if ba.ctx == nil || ba.ctx.GetConfig() == nil {
+		return nil, false, errors.New("IM lookup context is unavailable")
+	}
+	cfg := ba.ctx.GetConfig()
+	resp, err := network.Get(cfg.WuKongIM.APIURL+"/message/byclientmsgno", map[string]string{
+		"channel_id": channelID, "channel_type": strconv.Itoa(int(channelType)), "client_msg_no": clientMsgNo,
+	}, cfg.WuKongIMManagerTokenHeaderMap())
+	if err != nil {
+		return nil, false, fmt.Errorf("query persisted IM message: %w", err)
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, false, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, false, fmt.Errorf("query persisted IM message returned status %d", resp.StatusCode)
+	}
+	message := gjson.Parse(resp.Body)
+	if wrapped := message.Get("data"); wrapped.Exists() {
+		message = wrapped
+	}
+	messageID := message.Get("message_id").Int()
+	if messageID == 0 {
+		// The lookup can briefly return a successful envelope before the
+		// asynchronously appended message is readable. Treat that shape as a
+		// miss so the post-send poll continues; the bounded poll still fails
+		// closed if no canonical row ever appears.
+		return nil, false, nil
+	}
+	persistedClientMsgNo := message.Get("client_msg_no").String()
+	if persistedClientMsgNo != clientMsgNo {
+		return nil, false, errors.New("persisted IM message has a mismatched client_msg_no")
+	}
+	// client_msg_no is supplied by callers rather than allocated by IM. Never
+	// let a collision with another sender in the same channel turn that
+	// sender's message into this bot's canonical edit anchor.
+	if persistedFromUID := message.Get("from_uid").String(); persistedFromUID != fromUID {
+		return nil, false, errors.New("persisted IM message has a mismatched from_uid")
+	}
+	return &config.MsgSendResp{
+		MessageID: messageID, MessageSeq: uint32(message.Get("message_seq").Uint()),
+		ClientMsgNo: persistedClientMsgNo,
+	}, true, nil
 }
 
 // ensureMap returns a non-nil map, allocating one if needed. Used by the
@@ -693,20 +833,30 @@ func (ba *BotAPI) readReceipt(c *wkhttp.Context) {
 
 // ==================== Message Edit ====================
 
+// BotMessageEditReq is the normalized request shared by the generic edit
+// endpoint and server-authored structured card endpoints.
+type BotMessageEditReq struct {
+	MessageID   string `json:"message_id"`
+	MessageSeq  uint32 `json:"message_seq"`
+	ChannelID   string `json:"channel_id"`
+	ChannelType uint8  `json:"channel_type"`
+	ContentEdit string `json:"content_edit"`
+}
+
 // botMessageEdit handles POST /v1/bot/message/edit.
 func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, cardmsg.MaxSendBodyBytes)
-	var req struct {
-		MessageID   string `json:"message_id"`
-		MessageSeq  uint32 `json:"message_seq"`
-		ChannelID   string `json:"channel_id"`
-		ChannelType uint8  `json:"channel_type"`
-		ContentEdit string `json:"content_edit"`
-	}
+	var req BotMessageEditReq
 	if err := c.BindJSON(&req); err != nil {
 		respondBotAPIRequestInvalid(c, "")
 		return
 	}
+	ba.botMessageEditRequest(c, req)
+}
+
+// botMessageEditRequest preserves the existing ownership, lifecycle, profile,
+// authoritative plain, and card_seq CAS gates for structured card edits.
+func (ba *BotAPI) botMessageEditRequest(c *wkhttp.Context, req BotMessageEditReq) {
 	if req.MessageID == "" {
 		respondBotAPIRequestInvalid(c, "message_id")
 		return

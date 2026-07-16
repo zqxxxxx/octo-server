@@ -53,13 +53,16 @@ X-Internal-Token: <SUMMARY_NOTIFY_TOKEN>
   "targets":   ["uid_recipient"],  // 现状:单收件人
   "actor_uid": "",                 // 现状:DM 通知留空
   "card": {                        // 新增:非空即走 summary-notify 卡片 producer
-    "task_no":    "TN_20260713_abcd",   // ★ 见下「标识」
+    "task_id":    42,                    // Web 详情页/API 使用的数值主键
+    "task_no":    "TN_20260713_abcd",   // 稳定业务标识与日志字段
+    "summary_mode": 1,                   // 1=按群,2=按人;服务端选择动作文案
     "kind":       "completed",          // "completed" | "failed"
     "title":      "产品周会纪要",         // 原始标题(server 负责转义/截断)
     "time_range": "2026-07-06 10:00 ~ 2026-07-13 10:00", // 见下「时间/计数」
     "members":    5,                    // 参与人数;<=0 省略该行
     "msg_count":  128,                  // 消息条数;<=0 省略该行
     "generated_at": "2026-07-13 15:04", // 完成时间字符串;空则省略
+    "content":     "**关键结论**…",     // completed 正文;服务端截断并生成展开/收起
     "reason":     ""                    // failed 时的脱敏原因;completed 留空
   }
 }
@@ -69,10 +72,10 @@ X-Internal-Token: <SUMMARY_NOTIFY_TOKEN>
 
 ## 三个约定(建议默认,待确认)
 
-- **标识 `task_no`(不是自增 `id`)**:deep-link `/s/{task_no}?sp={space_id}` 用
-  `summary_task.task_no`(varchar unique)。理由:不可枚举 + 与前端
-  `WKApp.openSummaryDetail` 对齐。**待 smart-summary 确认前端 detail 入口用的是 task_no
-  还是 id。**
+- **详情路由使用 `task_id`**:deep-link `/s/{task_id}?sp={space_id}` 使用
+  `summary_task.id`。已核实 Web `WKApp.openSummaryDetail`、`SummaryDetailPage` 与
+  `/summary/api/v1/summaries/:id` 都接收数值 ID。`task_no` 仍随请求发送，作为稳定业务
+  标识与服务端日志字段；二者职责不混用。
 - **时间字段传「已格式化字符串」**:`time_range` / `generated_at` 由 smart-summary 用它
   自己的 `internal/timezone`(东八区)格式化后传字符串,octo-server 原样填进 FactSet 值。
   理由:octo-server 无该业务时区配置,避免时区漂移。**标签(“时间范围”)仍由 octo-server
@@ -84,13 +87,16 @@ X-Internal-Token: <SUMMARY_NOTIFY_TOKEN>
 
 | card 字段 | smart-summary 来源 |
 | --- | --- |
+| `task_id` | `SummaryTask.ID` |
 | `task_no` | `SummaryTask.TaskNo` |
+| `summary_mode` | `SummaryTask.SummaryMode` |
 | `kind` | `kindForStatus(status)`(completed/failed) |
 | `title` | `SummaryTask.Title` |
 | `time_range` | `formatTimeRange(task)`(现有) |
 | `members` | `participantCount(task)`(现有) |
 | `msg_count` | `summary_result.total_msg_count`(现有 `resultMeta`) |
 | `generated_at` | `summary_result.generated_at` 格式化(现有 `resultMeta`) |
+| `content` | `summary_result.content`，调用方与服务端均限制为 6000 Unicode 字符 |
 | `reason` | 现有 `errorSanitizer` 脱敏后的失败原因 |
 
 空间名(现在 smart-summary 自己 resolve)在卡片里不再需要——octo-server 侧可按 space_id

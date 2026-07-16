@@ -25,13 +25,16 @@ type NotifyReq struct {
 // 只承载原始字段;文案标签、布局、deep-link 由服务端 pkg/cardtmpl +
 // i18n.OutboundLanguage 生成。时间字段由调用方按其时区格式化后传字符串,计数传整数。
 type SummaryCardFields struct {
-	TaskNo      string `json:"task_no"`      // summary_task.task_no,用于 /s/{task_no}?sp={space_id}
+	TaskID      int64  `json:"task_id"`      // summary_task.id,用于 Web 详情路由 /s/{task_id}?sp={space_id}
+	TaskNo      string `json:"task_no"`      // summary_task.task_no,稳定业务标识与日志字段
+	SummaryMode int    `json:"summary_mode"` // 1=按群,2=按人;仅用于服务端选择动作文案
 	Kind        string `json:"kind"`         // "completed" | "failed"
 	Title       string `json:"title"`        // 总结标题(服务端转义/截断)
 	TimeRange   string `json:"time_range"`   // 已格式化的时间范围;空则省略
 	Members     int    `json:"members"`      // 参与人数;<=0 省略
 	MsgCount    int    `json:"msg_count"`    // 消息条数;<=0 省略
 	GeneratedAt string `json:"generated_at"` // 已格式化的生成时间;空则省略
+	Content     string `json:"content"`      // completed 的总结正文;服务端截断并生成展开/收起容器
 	Reason      string `json:"reason"`       // failed 的脱敏原因;completed 留空
 }
 

@@ -34,7 +34,7 @@ func (n *Notify) deliverCardNotification(req *NotifyReq) (*NotifyResp, error) {
 	if strings.TrimSpace(req.SpaceID) == "" || len(req.Targets) == 0 || len(req.Targets) > 200 {
 		return nil, errNotifyCardInvalid
 	}
-	if strings.TrimSpace(card.TaskNo) == "" || strings.TrimSpace(card.Title) == "" {
+	if card.TaskID <= 0 || strings.TrimSpace(card.TaskNo) == "" || strings.TrimSpace(card.Title) == "" {
 		return nil, errNotifyCardInvalid
 	}
 	if card.Kind != SummaryCardKindCompleted && card.Kind != SummaryCardKindFailed {
@@ -177,23 +177,33 @@ func (n *Notify) buildSummaryCard(ctx context.Context, spaceID string, card *Sum
 
 	attribution := labels.completedBanner
 	excerpt := ""
+	content := ""
+	actionTitle := labels.openGroupSummary
 	variant := "summary.completed"
 	if card.Kind == SummaryCardKindFailed {
 		attribution = labels.failedBanner
 		variant = "summary.failed"
+		actionTitle = labels.viewSummary
 		if reason := strings.TrimSpace(card.Reason); reason != "" {
 			excerpt = labels.failedPrefix + reason
+		}
+	} else {
+		content = card.Content
+		if card.SummaryMode == 2 {
+			actionTitle = labels.viewSummary
 		}
 	}
 
 	webLoginURL := n.ctx.GetConfig().External.WebLoginURL
-	return cardtmpl.BuildSummaryResourceCard(ctx, webLoginURL, card.TaskNo, spaceID, cardtmpl.ResourceCard{
-		Title:       card.Title,
-		Attribution: attribution,
-		Excerpt:     excerpt,
-		Facts:       facts,
-		Variant:     variant,
-		Source:      cardtmpl.Source{Label: labels.sourceLabel},
+	return cardtmpl.BuildSummaryResourceCard(ctx, webLoginURL, fmt.Sprintf("%d", card.TaskID), spaceID, cardtmpl.ResourceCard{
+		Title:              card.Title,
+		Attribution:        attribution,
+		Excerpt:            excerpt,
+		Content:            content,
+		Facts:              facts,
+		PrimaryActionTitle: actionTitle,
+		Variant:            variant,
+		Source:             cardtmpl.Source{Label: labels.sourceLabel},
 	})
 }
 
@@ -269,6 +279,8 @@ type summaryLabels struct {
 	completedHeadline string // fmt verb for the title, used by the text fallback
 	failedHeadline    string
 	sourceLabel       string // ResourceCard.Source.Label — "智能总结" / "Smart Summary"
+	openGroupSummary  string
+	viewSummary       string
 }
 
 // deliverDocsCardNotification is the docs-notify card path. Structurally it
@@ -532,6 +544,8 @@ func summaryLabelsFor(lang string) summaryLabels {
 			completedHeadline: "你的总结「%s」已生成完成。",
 			failedHeadline:    "你的总结「%s」生成失败。",
 			sourceLabel:       "智能总结",
+			openGroupSummary:  "进入群总结",
+			viewSummary:       "查看总结",
 		}
 	}
 	return summaryLabels{
@@ -548,5 +562,7 @@ func summaryLabelsFor(lang string) summaryLabels {
 		completedHeadline: "Your summary \"%s\" is ready.",
 		failedHeadline:    "Your summary \"%s\" failed to generate.",
 		sourceLabel:       "Smart Summary",
+		openGroupSummary:  "Open chat summary",
+		viewSummary:       "View summary",
 	}
 }

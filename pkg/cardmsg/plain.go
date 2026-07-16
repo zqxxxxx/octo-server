@@ -79,6 +79,12 @@ func collectPlain(items []interface{}, segs *[]string) {
 		if !ok {
 			continue
 		}
+		// Plain represents the card's initial visible state. ToggleVisibility
+		// targets that start hidden must not leak into push/search/digest text;
+		// otherwise preview+full-content cards duplicate the entire body.
+		if initiallyHidden(el) {
+			continue
+		}
 		switch el["type"] {
 		case "TextBlock":
 			if s, _ := el["text"].(string); s != "" {
@@ -109,7 +115,7 @@ func collectPlain(items []interface{}, segs *[]string) {
 					}
 				}
 			}
-		case "Container":
+		case "Container", "Column", "TableCell":
 			if sub, ok := el["items"].([]interface{}); ok {
 				collectPlain(sub, segs)
 			}
@@ -135,48 +141,59 @@ func collectPlain(items []interface{}, segs *[]string) {
 		case "ImageSet":
 			// 每张图一个 [图片] 占位（与单 Image 对等）。
 			if imgs, ok := el["images"].([]interface{}); ok {
-				for range imgs {
+				for _, image := range imgs {
+					if imageMap, ok := image.(map[string]interface{}); ok {
+						if initiallyHidden(imageMap) {
+							continue
+						}
+					}
 					*segs = append(*segs, PlaceholderImage)
 				}
 			}
 		case "Table":
-			// 递归 rows→cells→items（与 Container/ColumnSet 同款内容遍历）。
+			// 递归 rows→cells→items（各层都尊重初始 isVisible）。
 			if rows, ok := el["rows"].([]interface{}); ok {
-				for _, r := range rows {
-					row, ok := r.(map[string]interface{})
-					if !ok {
+				for _, rowValue := range rows {
+					row, ok := rowValue.(map[string]interface{})
+					if !ok || initiallyHidden(row) {
 						continue
 					}
-					cells, ok := row["cells"].([]interface{})
-					if !ok {
-						continue
-					}
-					for _, c := range cells {
-						cell, ok := c.(map[string]interface{})
-						if !ok {
+					cells, _ := row["cells"].([]interface{})
+					for _, cellValue := range cells {
+						cell, ok := cellValue.(map[string]interface{})
+						if !ok || initiallyHidden(cell) {
 							continue
 						}
-						if items, ok := cell["items"].([]interface{}); ok {
-							collectPlain(items, segs)
+						if cellItems, ok := cell["items"].([]interface{}); ok {
+							collectPlain(cellItems, segs)
 						}
 					}
 				}
 			}
+		case "TableRow":
+			if cells, ok := el["cells"].([]interface{}); ok {
+				collectPlain(cells, segs)
+			}
 		// ActionSet：动作（按钮）不参与 plain —— 按钮是操作面不是内容，无 case。
 		case "ColumnSet":
 			if cols, ok := el["columns"].([]interface{}); ok {
-				for _, c := range cols {
-					col, ok := c.(map[string]interface{})
-					if !ok {
+				for _, columnValue := range cols {
+					column, ok := columnValue.(map[string]interface{})
+					if !ok || initiallyHidden(column) {
 						continue
 					}
-					if sub, ok := col["items"].([]interface{}); ok {
-						collectPlain(sub, segs)
+					if columnItems, ok := column["items"].([]interface{}); ok {
+						collectPlain(columnItems, segs)
 					}
 				}
 			}
 		}
 	}
+}
+
+func initiallyHidden(element map[string]interface{}) bool {
+	visible, present := element["isVisible"].(bool)
+	return present && !visible
 }
 
 // stripMarkdown 把一段 AC markdown 文本降为可见纯文本（Decision 8：权威 plain

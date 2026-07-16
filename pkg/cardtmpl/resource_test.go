@@ -114,6 +114,46 @@ func TestBuildSummaryResourceCardIconIsOptional(t *testing.T) {
 	require.NoError(t, cardmsg.Validate(envelope))
 }
 
+func TestBuildSummaryResourceCardExpandableContent(t *testing.T) {
+	resource := exampleResourceCard()
+	resource.Excerpt = ""
+	resource.Content = "**关键结论**\n\n" + strings.Repeat("- 用户反馈已完成归类，下一步验证行动项。\n", 40)
+	resource.PrimaryActionTitle = "进入群总结"
+
+	document, err := BuildSummaryResourceCard(
+		localizedContext("zh-CN"),
+		"https://im.example.com/login",
+		"42",
+		"space-1",
+		resource,
+	)
+	require.NoError(t, err)
+
+	var card map[string]interface{}
+	require.NoError(t, json.Unmarshal(document, &card))
+	envelope := map[string]interface{}{
+		"type": cardmsg.InteractiveCard.Int(), "card_version": cardmsg.CardVersion,
+		"profile": cardmsg.ProfileV1, "card": card,
+	}
+	require.NoError(t, cardmsg.Validate(envelope))
+	assert.Contains(t, string(document), `"id":"summary-preview"`)
+	assert.Contains(t, string(document), `"id":"summary-full"`)
+	assert.Contains(t, string(document), `"type":"Action.ToggleVisibility"`)
+	assert.Contains(t, string(document), `"title":"展开全文"`)
+	assert.Contains(t, string(document), `"title":"收起"`)
+	assert.Contains(t, string(document), `"title":"进入群总结"`)
+}
+
+func TestBuildSummaryResourceCardBoundsFullContent(t *testing.T) {
+	resource := exampleResourceCard()
+	resource.Content = strings.Repeat("总", MaxSummaryContentRunes+500)
+	document, err := BuildSummaryResourceCard(
+		localizedContext("zh-CN"), "https://im.example.com", "42", "space-1", resource,
+	)
+	require.NoError(t, err)
+	assert.NotContains(t, string(document), strings.Repeat("总", MaxSummaryContentRunes+1))
+}
+
 func mustDecodeCard(t *testing.T, document []byte) map[string]interface{} {
 	t.Helper()
 	var card map[string]interface{}

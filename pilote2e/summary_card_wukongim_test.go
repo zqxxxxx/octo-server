@@ -98,7 +98,7 @@ func TestSummaryCard_DispatchesAndPersistsInWuKongIM(t *testing.T) {
 	doc, err := cardtmpl.BuildSummaryResourceCard(
 		context.Background(),
 		"https://im.example.com/login", // External.WebLoginURL origin
-		"TN_pilote2e_0001",
+		"9000001",                      // summary_task.id; task_no is a log/business identifier only
 		e2eSpaceID,
 		cardtmpl.ResourceCard{
 			Title:       "产品周会纪要",
@@ -195,7 +195,9 @@ func TestSummaryNotify_HTTPEndpointDeliversCardToWuKongIM(t *testing.T) {
 		Service: "summary-service",
 		Targets: []string{recipient},
 		Card: &notify.SummaryCardFields{
+			TaskID:      9000002,
 			TaskNo:      "TN_pilote2e_http",
+			SummaryMode: 1,
 			Kind:        notify.SummaryCardKindCompleted,
 			Title:       "产品周会纪要",
 			TimeRange:   "2026-07-06 10:00 ~ 2026-07-13 10:00",
@@ -239,8 +241,9 @@ func TestSummaryNotify_HTTPEndpointDeliversCardToWuKongIM(t *testing.T) {
 	assert.Equal(t, cardmsg.ProfileV1, msg["profile"])
 	assert.Equal(t, e2eSpaceID, msg["space_id"], "server-authored space_id on the wire")
 	assert.Equal(t, e2eNotifyBotID, msg["__from_uid"], "delivered by the bound notification bot")
-	// The deep link the server built from External.WebLoginURL + task_no.
-	assert.Contains(t, compactJSON(msg), "https://im.example.com/s/TN_pilote2e_http?sp="+e2eSpaceID)
+	// The deep link uses the numeric summary_task.id. task_no remains metadata
+	// for cross-service logging and must never be substituted into the Web URL.
+	assert.Contains(t, compactJSON(msg), "https://im.example.com/s/9000002?sp="+e2eSpaceID)
 	t.Logf("HTTP-path persisted card: message_id=%d message_seq=%d from_uid=%v",
 		intOf(msg["__message_id"]), intOf(msg["__message_seq"]), msg["__from_uid"])
 }

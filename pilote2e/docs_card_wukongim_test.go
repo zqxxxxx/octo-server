@@ -227,7 +227,8 @@ func TestSummaryAndDocsNotify_NoRegression(t *testing.T) {
 	summaryBody, _ := json.Marshal(notify.NotifyReq{
 		SpaceID: e2eSpaceID, Service: "summary-service", Targets: []string{recipient},
 		Card: &notify.SummaryCardFields{
-			TaskNo: "TN_regression_1", Kind: notify.SummaryCardKindCompleted, Title: "周会纪要",
+			TaskID: 9000003, TaskNo: "TN_regression_1", SummaryMode: 1,
+			Kind: notify.SummaryCardKindCompleted, Title: "周会纪要",
 			TimeRange: "2026-07-06 10:00 ~ 2026-07-13 10:00", Members: 3, MsgCount: 42,
 		},
 	})
@@ -253,7 +254,7 @@ func TestSummaryAndDocsNotify_NoRegression(t *testing.T) {
 				continue
 			}
 			pj := compactJSON(payload)
-			if bytes.Contains([]byte(pj), []byte("/s/TN_regression_1?sp="+e2eSpaceID)) {
+			if bytes.Contains([]byte(pj), []byte("/s/9000003?sp="+e2eSpaceID)) {
 				sawSummary = true
 			}
 			if bytes.Contains([]byte(pj), []byte("/d/d_regression_1?sp="+e2eSpaceID)) {
